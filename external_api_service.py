@@ -1,5 +1,5 @@
 """Service d'intégration avec les APIs externes (Ticketmaster, TMDb, Deezer, YouTube)"""
-import requests
+import aiohttp
 from typing import List, Dict
 import logging
 from config import TICKETMASTER_API_KEY, TMDB_API_KEY, YOUTUBE_API_KEY
@@ -14,11 +14,21 @@ class ExternalAPIService:
         self.tmdb_key = TMDB_API_KEY
         self.youtube_key = YOUTUBE_API_KEY
         self.deezer_base_url = "https://api.deezer.com"
+        self._session = None
         logger.info("✅ Service API externes initialisé")
+    
+    async def _get_session(self):
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
     
     # ===== ÉVÉNEMENTS (Ticketmaster) =====
     
-    def search_events(self, city: str = "Paris", keyword: str = "", limit: int = 5) -> List[Dict]:
+    async def search_events(self, city: str = "Paris", keyword: str = "", limit: int = 5) -> List[Dict]:
         """Recherche d'événements via Ticketmaster"""
         try:
             if not self.ticketmaster_key:
@@ -34,10 +44,11 @@ class ExternalAPIService:
                 "locale": "fr-FR"
             }
             
-            response = requests.get(url, params=params, timeout=5)
-            response.raise_for_status()
+            session = await self._get_session()
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                response.raise_for_status()
+                data = await response.json()
             
-            data = response.json()
             events = []
             
             if "_embedded" in data and "events" in data["_embedded"]:
@@ -78,14 +89,13 @@ class ExternalAPIService:
     
     # ===== FILMS (TMDb) =====
     
-    def search_movies(self, query: str = "", limit: int = 5) -> List[Dict]:
+    async def search_movies(self, query: str = "", limit: int = 5) -> List[Dict]:
         """Recherche de films via TMDb"""
         try:
             if not self.tmdb_key:
                 logger.warning("⚠️ Clé TMDb manquante")
                 return self._mock_movies()
             
-            # Si pas de query, récupérer les films populaires
             if not query:
                 url = "https://api.themoviedb.org/3/movie/now_playing"
                 params = {
@@ -103,10 +113,11 @@ class ExternalAPIService:
                     "page": 1
                 }
             
-            response = requests.get(url, params=params, timeout=5)
-            response.raise_for_status()
+            session = await self._get_session()
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                response.raise_for_status()
+                data = await response.json()
             
-            data = response.json()
             movies = []
             
             for movie in data.get("results", [])[:limit]:
@@ -146,24 +157,23 @@ class ExternalAPIService:
     
     # ===== MUSIQUE (Deezer) =====
     
-    def search_music(self, artist: str = "", track: str = "", limit: int = 5) -> List[Dict]:
+    async def search_music(self, artist: str = "", track: str = "", limit: int = 5) -> List[Dict]:
         """Recherche de musique via Deezer (API gratuite, pas de clé nécessaire)"""
         try:
             query = f"{artist} {track}".strip()
             
             if not query:
-                # Top tracks du moment
                 url = f"{self.deezer_base_url}/chart/0/tracks"
                 params = {"limit": limit}
             else:
-                # Recherche
                 url = f"{self.deezer_base_url}/search/track"
                 params = {"q": query, "limit": limit}
             
-            response = requests.get(url, params=params, timeout=5)
-            response.raise_for_status()
+            session = await self._get_session()
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                response.raise_for_status()
+                data = await response.json()
             
-            data = response.json()
             tracks = []
             
             for track in data.get("data", [])[:limit]:
@@ -198,7 +208,7 @@ class ExternalAPIService:
     
     # ===== VIDÉOS (YouTube) =====
     
-    def search_videos(self, query: str, limit: int = 5) -> List[Dict]:
+    async def search_videos(self, query: str, limit: int = 5) -> List[Dict]:
         """Recherche de vidéos via YouTube"""
         try:
             if not self.youtube_key:
@@ -216,10 +226,11 @@ class ExternalAPIService:
                 "relevanceLanguage": "fr"
             }
             
-            response = requests.get(url, params=params, timeout=5)
-            response.raise_for_status()
+            session = await self._get_session()
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                response.raise_for_status()
+                data = await response.json()
             
-            data = response.json()
             videos = []
             
             for item in data.get("items", []):

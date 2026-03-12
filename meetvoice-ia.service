@@ -1,0 +1,19 @@
+[Unit]
+Description=MeetVoice IA WebSocket Server
+After=network.target redis-server.service postgresql.service docker.service
+Wants=redis-server.service postgresql.service docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/ia
+Environment="PATH=/home/ia/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/home/ia/venv/bin/python /home/ia/main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meetvoice-ia
+
+[Install]
+WantedBy=multi-user.target

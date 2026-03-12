@@ -1,345 +1,245 @@
-"""Service de gestion des sessions persistantes pour les catégories avec mémoire"""
+"""Service de gestion des sessions avec embeddings vectoriels (pgvector) - ASYNC avec asyncpg"""
 import logging
 import uuid
-from typing import Optional, List, Dict
+import numpy as np
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import asyncpg
 from config import DB_NAME, DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, SESSION_CATEGORIES
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class SessionService:
-    """Service pour gérer les sessions de coaching persistantes"""
+class SessionServiceVectoriel:
 
-    def __init__(self):
-        """Initialise la connexion à PostgreSQL"""
-        self.connection_params = {
-            "dbname": DB_NAME,
-            "user": DB_USER,
-            "password": DB_PASSWORD,
-            "host": DB_HOST,
-            "port": DB_PORT,
-        }
-        self.conn = None
-        self._connect()
-        self._create_tables()
+    def __init__(self, embedding_model=None):
+        self.dsn = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        self.pool: Optional[asyncpg.Pool] = None
+        self.embedding_model = embedding_model
 
-    def _connect(self):
-        """Établit la connexion à la base de données"""
+    async def _ensure_pool(self):
+        if self.pool is None or self.pool._closed:
+            self.pool = await asyncpg.create_pool(
+                self.dsn, min_size=2, max_size=10, command_timeout=10
+            )
+            logger.info("asyncpg pool created for SessionService")
+
+    def set_embedding_model(self, model):
+        self.embedding_model = model
+
+    def _generate_embedding(self, text: str) -> Optional[np.ndarray]:
+        if not self.embedding_model:
+            return None
         try:
-            self.conn = psycopg2.connect(**self.connection_params)
-            logger.info("✅ SessionService connecté à PostgreSQL")
+            return self.embedding_model.encode(text, convert_to_numpy=True)
         except Exception as e:
-            logger.error(f"❌ Erreur connexion PostgreSQL: {e}")
-            self.conn = None
-
-    def _ensure_connection(self):
-        """Vérifie et rétablit la connexion si nécessaire"""
-        if self.conn is None or self.conn.closed:
-            self._connect()
-
-    def _create_tables(self):
-        """Crée les tables nécessaires si elles n'existent pas"""
-        self._ensure_connection()
-        if not self.conn:
-            return
-
-        create_sessions_table = """
-        CREATE TABLE IF NOT EXISTS coaching_sessions (
-            id SERIAL PRIMARY KEY,
-            session_id VARCHAR(64) UNIQUE NOT NULL,
-            user_id INTEGER NOT NULL,
-            expert_id VARCHAR(50) NOT NULL,
-            category VARCHAR(50) NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_active BOOLEAN DEFAULT TRUE,
-            summary TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON coaching_sessions(user_id);
-        CREATE INDEX IF NOT EXISTS idx_sessions_session_id ON coaching_sessions(session_id);
-        """
-
-        create_exchanges_table = """
-        CREATE TABLE IF NOT EXISTS session_exchanges (
-            id SERIAL PRIMARY KEY,
-            session_id VARCHAR(64) NOT NULL REFERENCES coaching_sessions(session_id),
-            user_message TEXT NOT NULL,
-            assistant_response TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            tokens_used INTEGER DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_exchanges_session_id ON session_exchanges(session_id);
-        """
-
-        try:
-            with self.conn.cursor() as cursor:
-                cursor.execute(create_sessions_table)
-                cursor.execute(create_exchanges_table)
-                self.conn.commit()
-                logger.info("✅ Tables de sessions créées/vérifiées")
-        except Exception as e:
-            logger.error(f"❌ Erreur création tables: {e}")
-            self.conn.rollback()
+            logger.error(f"Embedding error: {e}")
+            return None
 
     async def get_or_create_session(
-        self,
-        user_id: int,
-        expert_id: str,
-        category: str
+        self, user_id: str, expert_id: str, category: str
     ) -> str:
-        """
-        Récupère la session active ou en crée une nouvelle
-        
-        Args:
-            user_id: ID de l'utilisateur
-            expert_id: ID de l'expert
-            category: Catégorie de la session
-            
-        Returns:
-            str: session_id
-        """
-        self._ensure_connection()
-        if not self.conn:
-            return self._generate_session_id()
-
+        await self._ensure_pool()
         try:
-            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    """
-                    SELECT session_id FROM coaching_sessions 
-                    WHERE user_id = %s AND expert_id = %s AND is_active = TRUE
-                    ORDER BY updated_at DESC LIMIT 1
-                    """,
-                    (user_id, expert_id)
-                )
-                result = cursor.fetchone()
+            row = await self.pool.fetchrow(
+                """
+                SELECT session_id FROM coaching_sessions
+                WHERE user_id = $1 AND expert_id = $2 AND is_active = TRUE
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                user_id, expert_id
+            )
+            if row:
+                return row["session_id"]
 
-                if result:
-                    session_id = result["session_id"]
-                    cursor.execute(
-                        "UPDATE coaching_sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = %s",
-                        (session_id,)
-                    )
-                    self.conn.commit()
-                    logger.info(f"📂 Session existante récupérée: {session_id}")
-                    return session_id
-
-                session_id = self._generate_session_id()
-                cursor.execute(
-                    """
-                    INSERT INTO coaching_sessions (session_id, user_id, expert_id, category)
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    (session_id, user_id, expert_id, category)
-                )
-                self.conn.commit()
-                logger.info(f"📁 Nouvelle session créée: {session_id}")
-                return session_id
-
+            session_id = self._generate_session_id()
+            await self.pool.execute(
+                """
+                INSERT INTO coaching_sessions (session_id, user_id, expert_id, category)
+                VALUES ($1, $2, $3, $4)
+                """,
+                session_id, user_id, expert_id, category
+            )
+            return session_id
         except Exception as e:
-            logger.error(f"❌ Erreur get_or_create_session: {e}")
-            self.conn.rollback()
+            logger.error(f"get_or_create_session error: {e}")
             return self._generate_session_id()
 
     def _generate_session_id(self) -> str:
-        """Génère un ID de session unique"""
         return f"session_{uuid.uuid4().hex[:16]}"
 
-    async def get_session_history(
-        self,
-        session_id: str,
-        limit: int = 10
+    async def get_session_history(self, session_id: str, limit: int = 10) -> List[Dict]:
+        await self._ensure_pool()
+        try:
+            rows = await self.pool.fetch(
+                """
+                SELECT user_message as user, assistant_response as assistant,
+                       topics_extracted, created_at
+                FROM session_exchanges
+                WHERE session_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                session_id, limit
+            )
+            return list(reversed([dict(r) for r in rows]))
+        except Exception as e:
+            logger.error(f"get_session_history error: {e}")
+            return []
+
+    async def search_similar_messages(
+        self, session_id: str, query: str, limit: int = 5, similarity_threshold: float = 0.75
     ) -> List[Dict]:
-        """
-        Récupère l'historique des échanges d'une session
-        
-        Args:
-            session_id: ID de la session
-            limit: Nombre max d'échanges à récupérer
-            
-        Returns:
-            List[Dict]: Liste des échanges
-        """
-        self._ensure_connection()
-        if not self.conn:
+        await self._ensure_pool()
+        if not self.embedding_model:
             return []
 
         try:
-            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    """
-                    SELECT user_message as user, assistant_response as assistant, created_at
-                    FROM session_exchanges
-                    WHERE session_id = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    (session_id, limit)
-                )
-                results = cursor.fetchall()
-                return list(reversed([dict(r) for r in results]))
+            query_embedding = self._generate_embedding(query)
+            if query_embedding is None:
+                return []
 
+            vec_str = "[" + ",".join(map(str, query_embedding.tolist())) + "]"
+            rows = await self.pool.fetch(
+                """
+                SELECT * FROM search_similar_messages($1, $2::vector, $3)
+                WHERE similarity >= $4
+                """,
+                session_id, vec_str, limit, similarity_threshold
+            )
+            return [dict(r) for r in rows]
         except Exception as e:
-            logger.error(f"❌ Erreur get_session_history: {e}")
+            logger.error(f"search_similar_messages error: {e}")
             return []
 
     async def add_exchange(
-        self,
-        session_id: str,
-        user_message: str,
-        assistant_response: str,
-        expert_id: str,
-        tokens_used: int = 0
+        self, session_id: str, user_message: str, assistant_response: str,
+        expert_id: str, tokens_used: int = 0, topics: Optional[List[str]] = None
     ):
-        """
-        Ajoute un échange à la session
-        
-        Args:
-            session_id: ID de la session
-            user_message: Message de l'utilisateur
-            assistant_response: Réponse de l'assistant
-            expert_id: ID de l'expert
-            tokens_used: Nombre de tokens utilisés
-        """
-        self._ensure_connection()
-        if not self.conn:
-            return
-
+        await self._ensure_pool()
         try:
-            with self.conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO session_exchanges 
-                    (session_id, user_message, assistant_response, tokens_used)
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    (session_id, user_message, assistant_response, tokens_used)
-                )
-                cursor.execute(
-                    "UPDATE coaching_sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = %s",
-                    (session_id,)
-                )
-                self.conn.commit()
-                logger.info(f"💬 Échange ajouté à la session {session_id}")
+            embedding = self._generate_embedding(user_message)
 
+            if embedding is not None:
+                vec_str = "[" + ",".join(map(str, embedding.tolist())) + "]"
+                await self.pool.execute(
+                    """
+                    INSERT INTO session_exchanges
+                    (session_id, user_message, assistant_response, user_embedding, topics_extracted, tokens_used)
+                    VALUES ($1, $2, $3, $4::vector, $5, $6)
+                    """,
+                    session_id, user_message, assistant_response, vec_str, topics, tokens_used
+                )
+            else:
+                await self.pool.execute(
+                    """
+                    INSERT INTO session_exchanges
+                    (session_id, user_message, assistant_response, topics_extracted, tokens_used)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    session_id, user_message, assistant_response, topics, tokens_used
+                )
         except Exception as e:
-            logger.error(f"❌ Erreur add_exchange: {e}")
-            self.conn.rollback()
+            logger.error(f"add_exchange error: {e}")
+
+    async def get_contextual_history(
+        self, session_id: str, current_query: str, max_results: int = 10
+    ) -> Tuple[List[Dict], List[Dict]]:
+        recent = await self.get_session_history(session_id, limit=max_results)
+        similar = await self.search_similar_messages(session_id, current_query, limit=max_results)
+        return recent, similar
 
     async def get_user_sessions(
-        self,
-        user_id: int,
-        expert_id: Optional[str] = None,
-        active_only: bool = True
+        self, user_id: int, expert_id: Optional[str] = None, active_only: bool = True
     ) -> List[Dict]:
-        """
-        Récupère toutes les sessions d'un utilisateur
-        
-        Args:
-            user_id: ID de l'utilisateur
-            expert_id: Filtrer par expert (optionnel)
-            active_only: Ne retourner que les sessions actives
-            
-        Returns:
-            List[Dict]: Liste des sessions
-        """
-        self._ensure_connection()
-        if not self.conn:
-            return []
-
+        await self._ensure_pool()
         try:
-            with self.conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                query = """
-                    SELECT cs.*, 
-                           (SELECT COUNT(*) FROM session_exchanges WHERE session_id = cs.session_id) as exchange_count
-                    FROM coaching_sessions cs
-                    WHERE cs.user_id = %s
-                """
-                params = [user_id]
+            query = "SELECT * FROM active_sessions_stats WHERE user_id = $1"
+            params = [user_id]
 
-                if expert_id:
-                    query += " AND cs.expert_id = %s"
-                    params.append(expert_id)
+            if expert_id:
+                query += " AND expert_id = $2"
+                params.append(expert_id)
 
-                if active_only:
-                    query += " AND cs.is_active = TRUE"
-
-                query += " ORDER BY cs.updated_at DESC"
-
-                cursor.execute(query, tuple(params))
-                return [dict(r) for r in cursor.fetchall()]
-
+            rows = await self.pool.fetch(query, *params)
+            return [dict(r) for r in rows]
         except Exception as e:
-            logger.error(f"❌ Erreur get_user_sessions: {e}")
+            logger.error(f"get_user_sessions error: {e}")
             return []
 
     async def close_session(self, session_id: str, summary: Optional[str] = None):
-        """
-        Ferme une session et optionnellement ajoute un résumé
-        
-        Args:
-            session_id: ID de la session
-            summary: Résumé de la session (optionnel)
-        """
-        self._ensure_connection()
-        if not self.conn:
-            return
-
+        await self._ensure_pool()
         try:
-            with self.conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE coaching_sessions 
-                    SET is_active = FALSE, summary = %s, updated_at = CURRENT_TIMESTAMP
-                    WHERE session_id = %s
-                    """,
-                    (summary, session_id)
-                )
-                self.conn.commit()
-                logger.info(f"🔒 Session fermée: {session_id}")
-
+            await self.pool.execute(
+                """
+                UPDATE coaching_sessions
+                SET is_active = FALSE, summary = $1
+                WHERE session_id = $2
+                """,
+                summary, session_id
+            )
         except Exception as e:
-            logger.error(f"❌ Erreur close_session: {e}")
-            self.conn.rollback()
+            logger.error(f"close_session error: {e}")
 
-    async def get_session_summary(self, session_id: str) -> str:
-        """
-        Génère un résumé de la session pour le contexte
-        
-        Args:
-            session_id: ID de la session
-            
-        Returns:
-            str: Résumé textuel de la session
-        """
-        history = await self.get_session_history(session_id, limit=20)
-        
-        if not history:
-            return ""
+    async def get_session_exchanges(
+        self, session_id: str, limit: int = 50, offset: int = 0
+    ) -> List[Dict]:
+        await self._ensure_pool()
+        try:
+            rows = await self.pool.fetch(
+                """
+                SELECT id, user_message, assistant_response,
+                       topics_extracted, sentiment, created_at
+                FROM session_exchanges
+                WHERE session_id = $1
+                ORDER BY created_at ASC
+                LIMIT $2 OFFSET $3
+                """,
+                session_id, limit, offset
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(f"get_session_exchanges error: {e}")
+            return []
 
-        summary_parts = []
-        for i, exchange in enumerate(history[-5:], 1):
-            summary_parts.append(f"Échange {i}:")
-            summary_parts.append(f"  User: {exchange['user'][:100]}...")
-            summary_parts.append(f"  Assistant: {exchange['assistant'][:100]}...")
-
-        return "\n".join(summary_parts)
+    async def get_user_history_by_expert(
+        self, user_id: str, expert_id: str, limit: int = 20
+    ) -> List[Dict]:
+        await self._ensure_pool()
+        try:
+            rows = await self.pool.fetch(
+                """
+                SELECT cs.session_id, cs.category, cs.created_at,
+                       cs.updated_at, cs.last_message_at, cs.is_active,
+                       cs.message_count, cs.summary, cs.topics
+                FROM coaching_sessions cs
+                WHERE cs.user_id = $1 AND cs.expert_id = $2
+                ORDER BY cs.last_message_at DESC
+                LIMIT $3
+                """,
+                user_id, expert_id, limit
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(f"get_user_history_by_expert error: {e}")
+            return []
 
     def requires_session(self, category: str) -> bool:
-        """Vérifie si une catégorie nécessite une session"""
         return category in SESSION_CATEGORIES
+
+    async def close(self):
+        if self.pool:
+            await self.pool.close()
 
 
 _session_instance = None
 
 
-def get_session_service():
-    """Retourne l'instance singleton du service de sessions"""
+def get_session_service(embedding_model=None):
     global _session_instance
     if _session_instance is None:
-        _session_instance = SessionService()
+        _session_instance = SessionServiceVectoriel(embedding_model)
+    elif embedding_model and not _session_instance.embedding_model:
+        _session_instance.set_embedding_model(embedding_model)
     return _session_instance

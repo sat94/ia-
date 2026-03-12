@@ -1,23 +1,19 @@
-# FastAPI et WebSocket
 fastapi
 uvicorn[standard]
 websockets
 
-# IA et Classification
 sentence-transformers
 scikit-learn
 numpy
 aiohttp
-requests
+joblib
 
-# TTS
 edge-tts
 
-# Base de données
 psycopg2-binary
 asyncpg
-redis
 
-# Utilitaires
 python-dotenv
 
+librosa
+soundfile

@@ -4,3 +4,7 @@ __pycache__/
 audio/
 .zencoder/
 .zenflow/
+venv/
+.model_cache/
+backup_avant_vectoriel/
+.vscode/

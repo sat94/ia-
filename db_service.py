@@ -321,25 +321,18 @@ class DatabaseService:
         return []
 
     def get_user_interests(self, user_id) -> List[str]:
-        return self._get_m2m_values(user_id, """
-            SELECT h.hobie FROM compte_hobie h
-            JOIN compte_compte_hobie ch ON h.id = ch.hobie_id
-            WHERE ch.compte_id = %s
-        """)
+        results = self.execute_query("""
+            SELECT interests FROM profiles WHERE user_id = %s
+        """, (user_id,))
+        if results and results[0]['interests']:
+            return results[0]['interests']
+        return []
 
     def get_user_languages(self, user_id) -> List[str]:
-        return self._get_m2m_values(user_id, """
-            SELECT l.langue FROM compte_langue l
-            JOIN compte_compte_langue cl ON l.id = cl.langue_id
-            WHERE cl.compte_id = %s
-        """)
+        return []
 
     def get_user_values(self, user_id) -> List[str]:
-        return self._get_m2m_values(user_id, """
-            SELECT c.caractere FROM compte_caractere c
-            JOIN compte_compte_caractere cc ON c.id = cc.caractere_id
-            WHERE cc.compte_id = %s
-        """)
+        return []
 
     def get_matching_score(self, user_profile: Dict, target_profile: Dict) -> float:
         """Calcule un score de compatibilité entre deux profils (0-100)"""
@@ -411,6 +404,81 @@ class DatabaseService:
         final_score = (score / max_score) * 100 if max_score > 0 else 0
         return round(final_score, 2)
     
+    def _batch_load_user_data(self, user_ids: List[int]) -> Dict:
+        """Charge toutes les données (interests) pour plusieurs users en 1 requête"""
+        if not user_ids:
+            return {'interests': {}}
+        
+        user_ids_tuple = tuple(user_ids)
+        
+        interests_map = {}
+        results = self.execute_query("""
+            SELECT user_id, interests
+            FROM profiles
+            WHERE user_id IN %s
+        """, (user_ids_tuple,))
+        
+        if results:
+            for row in results:
+                uid = row['user_id']
+                interests_map[uid] = row['interests'] or []
+        
+        return {
+            'interests': interests_map
+        }
+
+    def get_matching_score_batch(
+        self, 
+        user_profile: Dict, 
+        target_profile: Dict,
+        user_data: Dict,
+        target_data: Dict
+    ) -> float:
+        """Calcule un score de compatibilité avec données pré-chargées"""
+        score = 0.0
+        max_score = 0.0
+
+        max_score += 30
+        if 'distance_km' in target_profile:
+            distance = target_profile['distance_km']
+            if distance <= 5:
+                score += 30
+            elif distance <= 10:
+                score += 24
+            elif distance <= 20:
+                score += 18
+            elif distance <= 50:
+                score += 12
+            else:
+                score += 5
+
+        max_score += 20
+        if 'age' in user_profile and 'age' in target_profile:
+            age_diff = abs(user_profile['age'] - target_profile['age'])
+            if age_diff <= 2:
+                score += 20
+            elif age_diff <= 5:
+                score += 16
+            elif age_diff <= 10:
+                score += 10
+            else:
+                score += 4
+
+        max_score += 50
+        user_interests = set(user_data.get('interests', []))
+        target_interests = set(target_data.get('interests', []))
+
+        if user_interests and target_interests:
+            common_interests = user_interests & target_interests
+            total_interests = user_interests | target_interests
+
+            if total_interests:
+                interest_ratio = len(common_interests) / len(total_interests)
+                score += interest_ratio * 50
+
+        final_score = (score / max_score) * 100 if max_score > 0 else 0
+        return round(final_score, 2)
+
     def find_best_matches(
         self,
         user_id: int,
@@ -420,28 +488,24 @@ class DatabaseService:
         limit: int = 10
     ) -> List[Dict]:
         """Trouve les meilleurs profils compatibles"""
-        # Récupérer le profil de l'utilisateur
         user_profile = self.get_profile_by_id(user_id)
         
         if not user_profile:
             logger.error(f"❌ Profil utilisateur {user_id} introuvable")
             return []
         
-        # Vérifier si l'utilisateur a des coordonnées GPS
         if 'latitude' not in user_profile or 'longitude' not in user_profile:
             logger.warning(f"⚠️ Profil {user_id} sans coordonnées GPS")
             return []
         
-        # Trouver les profils à proximité
         nearby_profiles = self.find_nearby_profiles(
             float(user_profile['latitude']),
             float(user_profile['longitude']),
             max_distance_km,
             user_id,
-            limit * 3  # Récupérer plus de profils pour avoir du choix
+            limit * 3
         )
         
-        # Filtrer par âge si spécifié
         if min_age or max_age:
             filtered = []
             for profile in nearby_profiles:
@@ -454,11 +518,22 @@ class DatabaseService:
                     filtered.append(profile)
             nearby_profiles = filtered
         
-        # Calculer les scores de compatibilité
-        for profile in nearby_profiles:
-            profile['match_score'] = self.get_matching_score(user_profile, profile)
+        all_ids = [user_id] + [p.get('user_id', p.get('id')) for p in nearby_profiles]
+        batch_data = self._batch_load_user_data(all_ids)
         
-        # Trier par score décroissant
+        user_data = {
+            'interests': batch_data['interests'].get(user_id, [])
+        }
+        
+        for profile in nearby_profiles:
+            profile_user_id = profile.get('user_id', profile.get('id'))
+            target_data = {
+                'interests': batch_data['interests'].get(profile_user_id, [])
+            }
+            profile['match_score'] = self.get_matching_score_batch(
+                user_profile, profile, user_data, target_data
+            )
+        
         nearby_profiles.sort(key=lambda x: x['match_score'], reverse=True)
         
         return nearby_profiles[:limit]
